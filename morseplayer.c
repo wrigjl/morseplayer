@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003-2005 Jason L. Wright (jason@thought.net)
+ * Copyright (c) 2003-2005,2017 Jason L. Wright (jason@thought.net)
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -34,7 +34,7 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <sys/audioio.h>
+#include "portaudio.h"
 #include <sys/queue.h>
 #include <sys/poll.h>
 #include <string.h>
@@ -48,6 +48,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <limits.h>
+#include <float.h>
 
 #ifndef BYTE_ORDER
 #error "no byte order defined"
@@ -55,34 +56,32 @@
 
 struct a_sound {
 	u_int len;
-	void *buf;
+	float *buf;
 };
 
 struct play_list {
-	SIMPLEQ_ENTRY(play_list) pl_nxt;
+	STAILQ_ENTRY(play_list) pl_nxt;
 	struct a_sound *pl_snd;
-	int8_t *pl_ptr;
+	float *pl_ptr;
 	u_int pl_res;
 };
 
 struct play_head {
-	SIMPLEQ_HEAD(, play_list)	l;
+	STAILQ_HEAD(, play_list)	l;
 	int nent;
 	int nsamps;
 };
 
 struct s_params {
 	u_int sp_rate;		/* sample rate */
-	double sp_hz;		/* audio frequency */
+	float sp_hz;		/* audio frequency */
 	u_int sp_ditlen;	/* dit length */
 	u_int sp_dahlen;	/* dah length */
 	u_int sp_inCharlen;	/* interCharacter length */
 	u_int sp_sampthresh;	/* threshold for queuing more audio */
 	u_int sp_blocksize;	/* audio block size */
-	u_int sp_channels;	/* number of channels */
-	u_int sp_precision;	/* sample precision (bits) */
-	int sp_fd;		/* audio file descriptor */
 	int sp_seenspace;	/* seen a space character? */
+	PaStream *sp_stream;	/* audio stream */
 };
 
 int diagmode;
@@ -113,6 +112,10 @@ void play_string(const char *);
 void convert_char(unsigned char, struct s_params *);
 int fetch_chars(int, struct s_params *);
 int feed_audio(struct s_params *);
+int mp_callback(const void *inputBuffer, void *outputBuffer,
+		unsigned long framesPerBuffer,
+		const PaStreamCallbackTimeInfo *timeInfo,
+		PaStreamCallbackFlags statusFlags, void *userData);
 int main_loop(struct s_params *);
 void time_check(struct s_params *);
 void test_times(struct s_params *);
@@ -149,8 +152,8 @@ xx_free(void *m, const char *fname, const int lineno)
 void
 playlist_init(void)
 {
-	SIMPLEQ_INIT(&playhead.l);
-	SIMPLEQ_INIT(&pl_freelist.l);
+	STAILQ_INIT(&playhead.l);
+	STAILQ_INIT(&pl_freelist.l);
 	playhead.nent = 0;
 	playhead.nsamps = 0;
 }
@@ -160,14 +163,14 @@ playlist_destroy(void)
 {
 	struct play_list *e;
 
-	while (!SIMPLEQ_EMPTY(&playhead.l)) {
-		e = SIMPLEQ_FIRST(&playhead.l);
-		SIMPLEQ_REMOVE_HEAD(&playhead.l, pl_nxt);
+	while (!STAILQ_EMPTY(&playhead.l)) {
+		e = STAILQ_FIRST(&playhead.l);
+		STAILQ_REMOVE_HEAD(&playhead.l, pl_nxt);
 		pl_free(e);
 	}
-	while (!SIMPLEQ_EMPTY(&pl_freelist.l)) {
-		e = SIMPLEQ_FIRST(&pl_freelist.l);
-		SIMPLEQ_REMOVE_HEAD(&pl_freelist.l, pl_nxt);
+	while (!STAILQ_EMPTY(&pl_freelist.l)) {
+		e = STAILQ_FIRST(&pl_freelist.l);
+		STAILQ_REMOVE_HEAD(&pl_freelist.l, pl_nxt);
 		x_free(e);
 	}
 }
@@ -175,7 +178,7 @@ playlist_destroy(void)
 void
 playlist_enqueue(struct play_list *e)
 {
-	SIMPLEQ_INSERT_TAIL(&playhead.l, e, pl_nxt);
+	STAILQ_INSERT_TAIL(&playhead.l, e, pl_nxt);
 	playhead.nent++;
 	playhead.nsamps += e->pl_snd->len;
 }
@@ -185,21 +188,21 @@ pl_alloc(void)
 {
 	struct play_list *e;
 
-	if (SIMPLEQ_EMPTY(&pl_freelist.l)) {
+	if (STAILQ_EMPTY(&pl_freelist.l)) {
 		e = x_malloc(sizeof(*e));
 		if (e == NULL)
 			return (NULL);
-		SIMPLEQ_INSERT_TAIL(&pl_freelist.l, e, pl_nxt);
+		STAILQ_INSERT_TAIL(&pl_freelist.l, e, pl_nxt);
 	}
-	e = SIMPLEQ_FIRST(&pl_freelist.l);
-	SIMPLEQ_REMOVE_HEAD(&pl_freelist.l, pl_nxt);
+	e = STAILQ_FIRST(&pl_freelist.l);
+	STAILQ_REMOVE_HEAD(&pl_freelist.l, pl_nxt);
 	return (e);
 }
 
 void
 pl_free(struct play_list *e)
 {
-	SIMPLEQ_INSERT_TAIL(&pl_freelist.l, e, pl_nxt);
+	STAILQ_INSERT_TAIL(&pl_freelist.l, e, pl_nxt);
 }
 
 int
@@ -344,60 +347,12 @@ fetch_chars(int fd, struct s_params *pars)
 }
 
 int
-feed_audio(struct s_params *pars)
-{
-	ssize_t r;
-	u_int res;
-
-	for (res = pars->sp_blocksize; res != 0;) {
-		struct play_list *e;
-
-		if (SIMPLEQ_EMPTY(&playhead.l)) {
-			r = write(pars->sp_fd, quietBlock.buf, res);
-			if (r == -1)
-				err(1, "write");
-			break;
-		}
-
-		e = SIMPLEQ_FIRST(&playhead.l);
-		if (e->pl_res > res) {
-			r = write(pars->sp_fd, e->pl_ptr, res);
-			if (r == -1)
-				err(1, "write");
-			e->pl_ptr += res;
-			e->pl_res -= res;
-			playhead.nsamps -= res;
-			break;
-		}
-
-		r = write(pars->sp_fd, e->pl_ptr, e->pl_res);
-		if (r == -1)
-			err(1, "write");
-		playhead.nsamps -= e->pl_res;
-		res -= e->pl_res;
-		playhead.nent--;
-		SIMPLEQ_REMOVE_HEAD(&playhead.l, pl_nxt);
-		pl_free(e);
-	}
-	return (0);
-}
-
-int
 main_loop(struct s_params *pars)
 {
 	struct pollfd fds[2];
-	ssize_t r;
 	int iseof = 0;
 
-	/*
-	 * first, play one block of silence... /dev/audio
-	 * isn't poll-able until it's been kicked.
-	 */
-	r = write(pars->sp_fd, quietBlock.buf, quietBlock.len);
-	if (r == -1)
-		err(1, "write");
-	
-	fds[0].fd = pars->sp_fd;
+	fds[0].fd = -1;
 	fds[0].events = POLLOUT;
 	fds[1].events = POLLIN;
 
@@ -407,23 +362,13 @@ main_loop(struct s_params *pars)
 		else
 			fds[1].fd = -1;
 
-		if (poll(fds, sizeof(fds)/sizeof(fds[0]), INFTIM) == -1)
+		if (poll(fds, sizeof(fds)/sizeof(fds[0]), 1000) == -1)
 			err(1, "poll");
 
 		if (fds[1].revents & POLLIN) {
 			/* go grab some data from stdin and queue it */
 			if (fetch_chars(fds[1].fd, pars))
-				iseof = 1;
-		}
-
-		if (fds[0].revents & POLLOUT) {
-			/* feed the audio device */
-			feed_audio(pars);
-			if (iseof && SIMPLEQ_EMPTY(&playhead.l)) {
-				if (ioctl(fds[0].fd, AUDIO_DRAIN, NULL) == -1)
-					err(1, "audio_drain");
 				break;
-			}
 		}
 	}
 
@@ -449,11 +394,9 @@ build_inChar(struct a_sound *snd, struct s_params *pars)
 		Tc = (3.0 * Ta) / 19.0;
 		samplen = Tc * (float)pars->sp_rate;
 	}
-	dit_samps = pars->sp_ditlen /
-	    (pars->sp_channels * (pars->sp_precision / 8));
+	dit_samps = pars->sp_ditlen;
 	charu = ((float)dit_samps) / 2.0;
-	snd->len = rintf(samplen - charu) *
-	    pars->sp_channels * (pars->sp_precision / 8);
+	snd->len = rintf(samplen - charu);
 	pars->sp_inCharlen = snd->len;
 	return (build_silence(snd, pars));
 }
@@ -477,13 +420,10 @@ build_inWord(struct a_sound *snd, struct s_params *pars)
 		Tc = (7.0 * Ta) / 19.0;
 		samplen = Tc * (float)pars->sp_rate;
 	}
-	ditsamp = ((float)pars->sp_ditlen / 2.0) /
-	    (pars->sp_channels * (pars->sp_precision / 8));
-	inCharSamp = pars->sp_inCharlen /
-	    (pars->sp_channels * (pars->sp_precision / 8));
+	ditsamp = (float)pars->sp_ditlen / 2.0;
+	inCharSamp = pars->sp_inCharlen;
 	m = inCharSamp + ditsamp;
-	snd->len = (u_int)rintf(samplen - m) *
-	    pars->sp_channels * (pars->sp_precision / 8);
+	snd->len = (u_int)rintf(samplen - m);
 	return (build_silence(snd, pars));
 }
 
@@ -521,24 +461,13 @@ build_dah(struct a_sound *snd, struct s_params *pars)
 int
 build_snd(struct a_sound *snd, struct s_params *pars, double units)
 {
-	u_int i, j, attack1, attack2, attack3, nsamps, idx;
-	float u, m, prec;
-
-	switch (pars->sp_precision) {
-	case 8:
-		prec = 127.0;
-		break;
-	case 16:
-		prec = 32767.0;
-		break;
-	default:
-		return (-1);
-	}
+	u_int i, attack1, attack2, attack3, nsamps, idx;
+	float u, m;
 
 	u = 1.2 / charwpm;
 	nsamps = rintf((units + 1.0) * u * (float)pars->sp_rate);
-	snd->len = nsamps * pars->sp_channels * (pars->sp_precision / 8);
-	snd->buf = (int8_t *)x_malloc(snd->len);
+	snd->len = nsamps;
+	snd->buf = (float *)x_malloc(snd->len * sizeof(float));
 	if (snd->buf == NULL)
 		return (-1);
 	attack2 = (u_int)rintf(units * u * (float)pars->sp_rate);
@@ -554,8 +483,7 @@ build_snd(struct a_sound *snd, struct s_params *pars, double units)
 
 
 	for (i = 0, idx = 0; i < nsamps; i++) {
-		double d;
-		float t = (double)i / (double)pars->sp_rate;
+		float t = (float)i / (float)pars->sp_rate;
 
 		if (i < attack1) {
 			float T = (double)attack1 / (double)pars->sp_rate;
@@ -574,20 +502,8 @@ build_snd(struct a_sound *snd, struct s_params *pars, double units)
 		else
 			m = 1.0;
 
-		d = rintf(m * prec * sinf(t * 2 * M_PI * pars->sp_hz));
-
-		if (pars->sp_precision == 8) {
-			for (j = 0; j < pars->sp_channels; j++) {
-				int8_t *bp = (int8_t *)snd->buf;
-
-				bp[idx++] = d;
-			}
-		} else if (pars->sp_precision == 16) {
-			for (j = 0; j < pars->sp_channels; j++) {
-				int16_t *bp = (int16_t *)snd->buf;
-				bp[idx++] = d;
-			}
-		}
+		snd->buf[idx] = m * sinf(t * 2.0f * M_PI * pars->sp_hz);
+		idx++;
 	}
 	return (0);
 }
@@ -667,13 +583,14 @@ time_check(struct s_params *pars)
 	float perword, e, m;
 
 	perword = 0;
-	perword += 10 * dit.len / pars->sp_channels / (pars->sp_precision / 8);
-	perword += 4 * dah.len / pars->sp_channels / (pars->sp_precision / 8);
-	perword += 5 * inChar.len / pars->sp_channels / (pars->sp_precision / 8);
-	perword += 1 * inWord.len / pars->sp_channels / (pars->sp_precision / 8);
+	perword += 10 * dit.len;
+	perword += 4 * dah.len;
+	perword += 5 * inChar.len;
+	perword += 1 * inWord.len;
+	
 	sampmin = (float)pars->sp_rate * 60.0;
 	m = sampmin/perword;
-	e = (fabsf(m - overallwpm)/overallwpm) * 100;
+	e = (fabs(m - overallwpm)/overallwpm) * 100;
 	if (e > 1.0) {
 		printf("dit %u dah %u inChar %u inWord %u\n",
 		    dit.len, dah.len, inChar.len, inWord.len);
@@ -726,10 +643,9 @@ int
 main(int argc, char *argv[])
 {
 	struct s_params pars;
-	int f, c;
-	audio_info_t ai;
+	int c;
+	PaError error;
 	float cwpm = -1.0, owpm = -1.0, pitch = -1.0;
-	char *afname = NULL;
 
 	while ((c = getopt(argc, argv, "c:d:f:w:D")) != EOF) {
 		switch (c) {
@@ -757,9 +673,6 @@ main(int argc, char *argv[])
 				return (1);
 			}
 			break;
-		case 'd':
-			afname = optarg;
-			break;
 		case 'D':
 			diagmode++;
 			break;
@@ -773,6 +686,7 @@ main(int argc, char *argv[])
 
 	if (pitch == -1.0)
 		pitch = 720.0;
+	pars.sp_hz = pitch;
 
 	if (owpm == -1.0 && cwpm == -1.0) {
 		/* Neither specified, assume Element 1 rates */
@@ -798,43 +712,33 @@ main(int argc, char *argv[])
 	overallwpm = owpm;
 	charwpm = cwpm;
 
-	if (afname == NULL)
-		afname = "/dev/audio";
+	error = Pa_Initialize();
+	if (error != paNoError)
+		err(1, "portaudio: %s", Pa_GetErrorText(error));
 
-	f = open(afname, O_WRONLY, 0);
-	if (f == -1)
-		err(1, "open %s", afname);
-
-	AUDIO_INITINFO(&ai);
-	/* ai.play.sample_rate = 22050; */
-	ai.play.encoding = AUDIO_ENCODING_SLINEAR;
-	ai.play.precision = 8;
-	ai.play.channels = 1;
-	if (ioctl(f, AUDIO_SETINFO, &ai) == -1) {
-#if BYTE_ORDER == LITTLE_ENDIAN
-		ai.play.encoding = AUDIO_ENCODING_SLINEAR_LE;
-#elif BYTE_ORDER == BIG_ENDIAN
-		ai.play.encoding = AUDIO_ENCODING_SLINEAR_BE;
-#else
-# error "oh please, get the pdp outta here."
-#endif
-		ai.play.precision = 16;
-		ai.play.channels = 2;
-		if (ioctl(f, AUDIO_SETINFO, &ai) == -1) {
-			err(1, "setinfo");
-		}
+	pars.sp_rate = 44100;
+	pars.sp_sampthresh = pars.sp_rate;
+	error = Pa_OpenDefaultStream(&pars.sp_stream,
+				     0, /* no input */
+				     2, /* stereo output */
+				     paFloat32, /* float output */
+				     pars.sp_rate, /* sample rate */
+				     paFramesPerBufferUnspecified,
+				     mp_callback,
+				     NULL);
+	if (error != paNoError) {
+		warn("portaudio: %s", Pa_GetErrorText(error));
+		if ((error = Pa_Terminate()) != paNoError)
+			err(1, "portaudio: %s", Pa_GetErrorText(error));
+		exit(1);
 	}
 
-	if (ioctl(f, AUDIO_GETINFO, &ai) == -1)
-		err(1, "getinfo");
-	pars.sp_rate = ai.play.sample_rate;
-	pars.sp_hz = pitch;
-	pars.sp_sampthresh = ai.blocksize * ai.hiwat;
-	pars.sp_blocksize = ai.blocksize;
-	pars.sp_seenspace = 0;
-	pars.sp_fd = f;
-	pars.sp_channels = ai.play.channels;
-	pars.sp_precision = ai.play.precision;
+	if ((error = Pa_StartStream(pars.sp_stream)) != paNoError) {
+		warn("portaudio: StartStream: %s", Pa_GetErrorText(error));
+		Pa_CloseStream(pars.sp_stream);
+		Pa_Terminate();
+		exit(1);
+	}
 
 	if (diagmode > 0) {
 		check_chars();
@@ -849,5 +753,42 @@ main(int argc, char *argv[])
 	destroy_sounds();
 	playlist_destroy();
 
+	if ((error = Pa_Terminate()) != paNoError)
+		err(1, "portaudio: %s", Pa_GetErrorText(error));
+
+	return (0);
+}
+
+int
+mp_callback(const void *inputBuffer, void *outputBuffer,
+	    unsigned long framesPerBuffer,
+	    const PaStreamCallbackTimeInfo *timeInfo,
+	    PaStreamCallbackFlags statusFlags,
+	    void *userData) {
+	float *out = outputBuffer;
+	unsigned int i;
+
+	for (i = 0; i < framesPerBuffer; i++) {
+		struct play_list *e;
+		
+		if (STAILQ_EMPTY(&playhead.l)) {
+			/* nothing queued, play silence */
+			*out++ = 0.0f;
+			*out++ = 0.0f;
+			continue;
+		}
+
+		e = STAILQ_FIRST(&playhead.l);
+		*out++ = *e->pl_ptr;
+		*out++ = *e->pl_ptr;
+		e->pl_ptr++;
+		e->pl_res--;
+		playhead.nsamps--;
+		if (e->pl_res == 0) {
+			playhead.nent--;
+			STAILQ_REMOVE_HEAD(&playhead.l, pl_nxt);
+			pl_free(e);
+		}
+	}
 	return (0);
 }

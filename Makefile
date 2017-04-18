@@ -1,8 +1,12 @@
-PROG=morseplayer
-SRCS=morseplayer.c
-LDADD=-lm
-CFLAGS+=-Wall -Wstrict-prototypes -Wmissing-prototypes
-BINDIR=/usr/local/bin
-MANDIR=/usr/local/man/man
+OPTIM=-O
+WARNS=-Wall -Wstrict-prototypes -Wmissing-prototypes
 
-.include <bsd.prog.mk>
+PORTAUDIO_CFLAGS=`pkg-config portaudio-2.0 --cflags`
+PORTAUDIO_LIBS=`pkg-config portaudio-2.0 --libs`
+
+CFLAGS=$(OPTIM) $(WARNS) $(PORTAUDIO_CFLAGS)
+
+LDFLAGS=$(PORTAUDIO_LIBS)
+
+morseplayer: morseplayer.c
+	$(CC) -o $@ $< $(CFLAGS) $(LDFLAGS)
